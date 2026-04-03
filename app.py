@@ -3,7 +3,7 @@ import tensorflow as tf
 import numpy as np
 import cv2
 from PIL import Image
-import os
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 
 # =========================
 # PAGE CONFIG
@@ -11,44 +11,23 @@ import os
 st.set_page_config(page_title="AI EyeCare Pro+", layout="wide")
 
 # =========================
-# LOAD MODEL
+# LOAD MODEL (Revised for Full Model Load)
 # =========================
 @st.cache_resource
 def load_model():
     try:
-        from tensorflow.keras.applications import MobileNetV2
-        from tensorflow.keras import layers, models
-
-        # Rebuilding the architecture exactly as you had it
-        base_model = MobileNetV2(
-            input_shape=(224,224,3),
-            include_top=False,
-            weights=None
-        )
-
-        model = models.Sequential([
-            base_model,
-            layers.GlobalAveragePooling2D(),
-            layers.Dense(128, activation='relu'),
-            layers.Dropout(0.3),
-            layers.Dense(4, activation='softmax')
-        ])
-
-        model.build((None, 224, 224, 3))
-        
-        # FIX: skip_mismatch and by_name resolve the "Layer Conv1 expected 1 variables" error
-        model.load_weights("final.weights.h5", skip_mismatch=True, by_name=True)
-
+        # Load the complete model object directly to avoid layer naming mismatches
+        # Ensure you have uploaded 'full_eye_model.h5' (saved via model.save() in Kaggle)
+        model = tf.keras.models.load_model("full_eye_model.h5", compile=False)
         return model
-
     except Exception as e:
         st.error(f"❌ Model load error: {e}")
+        st.info("Tip: Make sure you uploaded the 'full' model file, not just the weights.")
         return None
 
 model = load_model()
 
 if model is None:
-    st.warning("Please ensure 'final.weights.h5' is in your GitHub folder.")
     st.stop()
 
 class_names = ['CNV', 'DME', 'DRUSEN', 'NORMAL']
@@ -72,10 +51,10 @@ def generate_report(disease, confidence):
     }
 
     treatment = {
-        'CNV': ["Immediate consultation with an ophthalmologist", "Anti-VEGF injections", "OCT monitoring", "Possible laser therapy", "Avoid smoking"],
-        'DME': ["Strict blood sugar control", "Anti-VEGF therapy", "Regular retinal examinations", "Healthy diet", "BP management"],
-        'DRUSEN': ["Routine eye monitoring every 6–12 months", "AREDS supplements", "UV-protection", "Antioxidant-rich diet", "Avoid smoking"],
-        'NORMAL': ["Maintain regular eye checkups", "Balanced diet", "Limit screen time", "UV protection"]
+        'CNV': ["Immediate consultation with an ophthalmologist", "Anti-VEGF injections", "OCT monitoring", "Possible laser therapy"],
+        'DME': ["Strict blood sugar control", "Anti-VEGF therapy", "Regular retinal examinations", "Healthy diet"],
+        'DRUSEN': ["Routine eye monitoring every 6–12 months", "AREDS supplements", "UV-protection", "Diet rich in antioxidants"],
+        'NORMAL': ["Maintain regular eye checkups", "Balanced diet", "Limit screen time", "Protect eyes from UV"]
     }
 
     followup = {
@@ -106,39 +85,43 @@ def generate_report(disease, confidence):
     return report
 
 # =========================
-# GRAD-CAM
+# GRAD-CAM (Visual Explanation)
 # =========================
 def get_gradcam(model, img_array):
-    base_model = model.layers[0]
-    last_conv = None
-    for layer in base_model.layers[::-1]:
-        if isinstance(layer, tf.keras.layers.Conv2D):
-            last_conv = layer
+    # Search for the last convolutional layer
+    last_conv_layer = None
+    for layer in reversed(model.layers):
+        if isinstance(layer, tf.keras.layers.Conv2D) or "conv" in layer.name.lower():
+            last_conv_layer = layer
             break
+            
+    if not last_conv_layer:
+        # Fallback for nested models (like MobileNetV2 as a base layer)
+        base_model = model.layers[0]
+        for layer in reversed(base_model.layers):
+            if "conv" in layer.name.lower():
+                last_conv_layer = layer
+                break
 
     grad_model = tf.keras.models.Model(
-        inputs=base_model.input,
-        outputs=[last_conv.output, base_model.output]
+        inputs=[model.inputs],
+        outputs=[last_conv_layer.output, model.output]
     )
 
     with tf.GradientTape() as tape:
-        conv_output, base_output = grad_model(img_array)
-        x = base_output
-        for layer in model.layers[1:]:
-            x = layer(x)
-        preds = x
-        class_idx = tf.argmax(preds[0])
-        loss = preds[:, class_idx]
+        conv_outputs, predictions = grad_model(img_array)
+        loss = predictions[:, np.argmax(predictions[0])]
 
-    grads = tape.gradient(loss, conv_output)
-    pooled_grads = tf.reduce_mean(grads, axis=(0,1,2))
-    heatmap = conv_output[0] @ pooled_grads[..., tf.newaxis]
+    grads = tape.gradient(loss, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    
+    heatmap = conv_outputs[0] @ pooled_grads[..., tf.newaxis]
     heatmap = tf.squeeze(heatmap)
     heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-8)
     return heatmap.numpy()
 
 # =========================
-# UI DESIGN (UNCHANGED)
+# UI DESIGN (Kept exactly as requested)
 # =========================
 st.markdown("""
 <style>
@@ -155,20 +138,24 @@ st.markdown("## 📤 Upload OCT Scan")
 uploaded_file = st.file_uploader("", type=["jpg","png","jpeg"])
 
 # =========================
-# MAIN
+# MAIN LOGIC
 # =========================
 if uploaded_file:
     image = Image.open(uploaded_file).convert("RGB")
     col1, col2 = st.columns([1,2])
 
     with col1:
-        # FIX: Changed use_container_width to use_column_width for Streamlit 1.33
+        # Fixed: Changed use_container_width to use_column_width for version 1.33.0 compatibility
         st.image(image, use_column_width=True)
 
+    # Preprocessing
     img = image.resize((224,224))
-    img_array = np.array(img)/255.0
+    img_array = np.array(img)
     img_array = np.expand_dims(img_array, axis=0)
+    # Fixed: Using MobileNetV2 official preprocessing to fix accuracy shift
+    img_array = preprocess_input(img_array)
 
+    # Prediction
     prediction = model.predict(img_array)
     disease = class_names[np.argmax(prediction)]
     confidence = float(np.max(prediction))
@@ -194,13 +181,17 @@ if uploaded_file:
     st.markdown(f"""<div class="report">{formatted_report}</div>""", unsafe_allow_html=True)
 
     st.markdown("### 🔥 AI Attention Map")
-    heatmap = get_gradcam(model, img_array)
-    heatmap = cv2.resize(heatmap, (224,224))
-    heatmap = np.uint8(255 * heatmap)
-    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-    original = np.uint8(img_array[0] * 255)
-    overlay = cv2.addWeighted(original, 0.6, heatmap, 0.4, 0)
+    try:
+        heatmap = get_gradcam(model, img_array)
+        heatmap = cv2.resize(heatmap, (224,224))
+        heatmap = np.uint8(255 * heatmap)
+        heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
 
-    # FIX: Changed use_container_width to use_column_width
-    st.image(overlay, use_column_width=True)
+        # Standardizing image for overlay
+        original = np.array(image.resize((224,224)))
+        overlay = cv2.addWeighted(original, 0.6, heatmap, 0.4, 0)
+        st.image(overlay, use_column_width=True)
+    except Exception as e:
+        st.write("Heatmap could not be generated for this image.")
+
     st.caption("⚠️ AI-assisted result. Always consult a certified ophthalmologist.")
